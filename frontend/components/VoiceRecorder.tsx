@@ -28,6 +28,7 @@ export default function VoiceRecorder({ onTranscribe, isLoading }: VoiceRecorder
     recognitionRef.current.onresult = (event: any) => {
       for (let i = event.resultIndex; i < event.results.length; i++) {
         if (event.results[i].isFinal) {
+          // always append to existing transcript — never reset
           setTranscript((prev) => prev + event.results[i][0].transcript + ' ')
         }
       }
@@ -42,6 +43,7 @@ export default function VoiceRecorder({ onTranscribe, isLoading }: VoiceRecorder
   }
 
   const startRecording = async () => {
+    // re-init only if not yet created — keeps existing transcript intact
     if (!recognitionRef.current) initSpeechRecognition()
     if (recognitionRef.current) {
       try { recognitionRef.current.start() } catch {}

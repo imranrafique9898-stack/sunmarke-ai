@@ -77,3 +77,42 @@ export const getStats = async (): Promise<ApiStats> => {
 }
 
 export default apiClient
+
+export interface StreamToken {
+  model: 'groq1' | 'groq2'
+  token: string
+  done: boolean
+}
+
+export async function streamQuery(
+  query: string,
+  onToken: (model: 'groq1' | 'groq2', token: string, done: boolean) => void
+): Promise<void> {
+  const response = await fetch(`${API_URL}/api/query/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, transcribed_text: query }),
+  })
+
+  if (!response.ok) throw new Error(`Stream error: ${response.status}`)
+  if (!response.body) throw new Error('No response body')
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() ?? ''
+    for (const line of lines) {
+      if (!line.trim()) continue
+      try {
+        const parsed: StreamToken = JSON.parse(line)
+        onToken(parsed.model, parsed.token, parsed.done)
+      } catch {}
+    }
+  }
+}

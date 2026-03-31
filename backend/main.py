@@ -5,9 +5,11 @@ Orchestrates RAG, embeddings, and LLM responses
 
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 import asyncio
+import json
 import time
 import os
 from dotenv import load_dotenv
@@ -191,6 +193,78 @@ async def process_query(
     except Exception as e:
         print(f"❌ Error processing query: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/query/stream", tags=["Query"])
+async def stream_query(request: QueryRequest, db: Session = Depends(get_db)):
+    """Stream responses from both LLMs token by token using SSE."""
+    if not rag_service:
+        raise HTTPException(status_code=503, detail="RAG service not initialized")
+
+    chunks, sources = rag_service.retrieve_context(request.query, top_k=8)
+    context = rag_service.build_context_string(chunks) if chunks else "No specific information found."
+    rag_prompt = rag_service.generate_rag_prompt(request.query, context)
+
+    async def event_generator():
+        import httpx
+        api_key = os.getenv("GROQ_API_KEY", "")
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        models = [("groq1", "llama-3.3-70b-versatile"), ("groq2", "gemma2-9b-it")]
+
+        async def stream_model(label: str, model: str, queue: asyncio.Queue):
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant for Sunmarke School."},
+                    {"role": "user", "content": rag_prompt},
+                ],
+                "temperature": 0.7,
+                "max_tokens": 1000,
+                "stream": True,
+            }
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    async with client.stream("POST", "https://api.groq.com/openai/v1/chat/completions",
+                                             headers=headers, json=payload) as resp:
+                        async for line in resp.aiter_lines():
+                            if line.startswith("data: "):
+                                data = line[6:]
+                                if data.strip() == "[DONE]":
+                                    await queue.put(json.dumps({"model": label, "token": "", "done": True}) + "\n")
+                                    return
+                                try:
+                                    chunk_data = json.loads(data)
+                                    token = chunk_data["choices"][0]["delta"].get("content", "")
+                                    if token:
+                                        await queue.put(json.dumps({"model": label, "token": token, "done": False}) + "\n")
+                                except Exception:
+                                    pass
+            except Exception as e:
+                await queue.put(json.dumps({"model": label, "token": f"Error: {e}", "done": True}) + "\n")
+            await queue.put(None)
+
+        queues = [asyncio.Queue() for _ in models]
+        tasks = [asyncio.create_task(stream_model(label, model, q)) for (label, model), q in zip(models, queues)]
+        done = [False] * len(models)
+
+        while not all(done):
+            for i, queue in enumerate(queues):
+                if done[i]:
+                    continue
+                try:
+                    item = queue.get_nowait()
+                    if item is None:
+                        done[i] = True
+                    else:
+                        yield item
+                except asyncio.QueueEmpty:
+                    pass
+            await asyncio.sleep(0.01)
+
+        await asyncio.gather(*tasks)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.post("/api/initialize", tags=["Admin"])
